@@ -2,7 +2,8 @@
 import ipaddress
 import socket
 import logging
-from typing import List, Optional, Iterable
+import re
+from typing import List, Optional, Iterable, Union
 
 logger = logging.getLogger(__name__)
 
@@ -14,6 +15,52 @@ TOP_PORTS = {
     1000: [i for i in range(1, 1025)],
 }
 
+def validate_target(target: str) -> bool:
+    """
+    Validate if the target is a valid IP address, hostname, CIDR notation, or IP range.
+    
+    Args:
+        target: Target to validate (IP, hostname, CIDR, or range)
+        
+    Returns:
+        bool: True if target is valid, False otherwise
+    """
+    try:
+        # Check for CIDR notation
+        if '/' in target:
+            ipaddress.ip_network(target, strict=False)
+            return True
+            
+        # Check for IP range (e.g., 192.168.1.1-10)
+        if '-' in target:
+            start, end = target.split('-')
+            try:
+                start_ip = ipaddress.ip_address(start)
+                # If end is just a number, append it to the start IP's network
+                if end.isdigit():
+                    end_ip = ipaddress.ip_address(f"{'.'.join(start.split('.')[:-1])}.{end}")
+                else:
+                    end_ip = ipaddress.ip_address(end)
+                return start_ip < end_ip
+            except ValueError:
+                return False
+                
+        # Check for single IP
+        try:
+            ipaddress.ip_address(target)
+            return True
+        except ValueError:
+            pass
+            
+        # Check for valid hostname
+        if re.match(r'^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z]{2,})+$', target):
+            return True
+            
+        return False
+        
+    except Exception:
+        return False
+
 def validate_ip(ip: str) -> bool:
     """Validates if a string is a valid IP address."""
     try:
@@ -22,9 +69,13 @@ def validate_ip(ip: str) -> bool:
     except ValueError:
         return False
 
-def validate_port(port: int) -> bool:
+def validate_port(port: Union[int, str]) -> bool:
     """Validates if an integer is a valid port number (1-65535)."""
-    return isinstance(port, int) and 0 < port <= 65535
+    try:
+        port_num = int(port)
+        return 0 < port_num < 65536
+    except (ValueError, TypeError):
+        return False
 
 def resolve_target(target_str: str) -> List[str]:
     """
