@@ -1,57 +1,73 @@
-#scanner/utils.py
+# scanner/utils.py
 import ipaddress
 import socket
+import logging
+from typing import List, Optional, Iterable
+
+logger = logging.getLogger(__name__)
 
 # Predefined common ports for top N scans (expand as needed)
 TOP_PORTS = {
     10: [80, 443, 22, 21, 25, 110, 445, 3389, 139, 53],
     100: [80, 443, 22, 21, 25, 110, 445, 3389, 139, 53, 3306, 8080, 5900, 53, 23, 135, 143, 995, 1723, 111, 993, 8443, 1025, 1110, 1521, 5432, 8000, 32768, 32769, 49152, 49153, 49154, 49155, 49156, 49157, 49158, 49159, 49160, 49161, 49162, 49163, 49164, 49165, 49166, 49167, 49168, 49169, 49170, 49171, 49172, 49173, 49174, 49175, 49176, 49177, 49178, 49179, 49180, 49181, 49182, 49183, 49184, 49185, 49186, 49187, 49188, 49189, 49190, 49191, 49192, 49193, 49194, 49195, 49196, 49197, 49198, 49199, 49200, 49201, 49202, 49203, 49204, 49205, 49206, 49207, 49208, 49209, 49210, 49211, 49212, 49213, 49214, 49215, 49216],
-    1000: [i for i in range(1, 1025)],  # Default top 1000 ports (simplified)
+    # 1000: Default top 1000 ports (simplified as 1-1024 in this implementation)
+    1000: [i for i in range(1, 1025)],
 }
 
-def validate_ip(ip):
+def validate_ip(ip: str) -> bool:
+    """Validates if a string is a valid IP address."""
     try:
         ipaddress.ip_address(ip)
         return True
     except ValueError:
         return False
 
-def validate_port(port):
+def validate_port(port: int) -> bool:
+    """Validates if an integer is a valid port number (1-65535)."""
     return isinstance(port, int) and 0 < port <= 65535
 
-def resolve_target(target_str):
-    """Resolves a single target string to a list of IP addresses."""
+def resolve_target(target_str: str) -> List[str]:
+    """
+    Resolves a single target string (IP, CIDR, range, or hostname) to a list of unique IP addresses.
+    Raises ValueError for invalid formats or socket.gaierror for unresolvable hostnames.
+    """
     ips = []
+    
+    # Try CIDR block
     try:
-        # CIDR block?
         network = ipaddress.ip_network(target_str, strict=False)
-        for ip_obj in network.hosts():
-            ips.append(str(ip_obj))
-        if not ips and network.num_addresses == 1:  # /32
+        # If it's a /32 or /128, only the network address is the host
+        if network.num_addresses == 1:
             ips.append(str(network.network_address))
+        else:
+            for ip_obj in network.hosts(): # .hosts() excludes network and broadcast addresses
+                ips.append(str(ip_obj))
         return ips
     except ValueError:
-        pass
+        pass # Not a CIDR, continue to next check
 
-    try:
-        # IP range (e.g., 192.168.1.1-100 or 192.168.1.1-192.168.1.100)
-        if '-' in target_str:
+    # Try IP range (e.g., 192.168.1.1-100 or 192.168.1.1-192.168.1.100)
+    if '-' in target_str:
+        try:
             start_ip_str, end_ip_str = target_str.split('-', 1)
             start_ip = ipaddress.ip_address(start_ip_str)
 
-            if '.' not in end_ip_str:  # e.g., 192.168.1.1-100
-                end_ip_val = int(end_ip_str)
-                if not (0 <= end_ip_val <= 255):
-                    raise ValueError("Invalid last octet in IP range.")
-                base_ip_parts = list(start_ip.packed)
-                end_ip = ipaddress.ip_address(bytes(base_ip_parts[:-1] + [end_ip_val]))
-            else:
+            if '.' not in end_ip_str and ':' not in end_ip_str:  # e.g., 192.168.1.1-100
+                if start_ip.version == 4:
+                    end_octet_val = int(end_ip_str)
+                    if not (0 <= end_octet_val <= 255):
+                        raise ValueError("Invalid last octet in IP range.")
+                    base_ip_parts = list(start_ip.packed)
+                    end_ip = ipaddress.ip_address(bytes(base_ip_parts[:-1] + [end_octet_val]))
+                else: # IPv6 ranges like 2001:db8::1-100 are not supported by this shorthand
+                    raise ValueError("IPv6 ranges require full IP addresses (e.g., fe80::1-fe80::100).")
+            else: # e.g., 192.168.1.1-192.168.1.100 or fe80::1-fe80::100
                 end_ip = ipaddress.ip_address(end_ip_str)
 
             if start_ip.version != end_ip.version:
-                raise ValueError("Start and end IP must be same version.")
+                raise ValueError("Start and end IP must be the same version (IPv4 or IPv6).")
             if int(start_ip) > int(end_ip):
-                raise ValueError("Start IP must be <= end IP in range.")
+                raise ValueError("Start IP must be less than or equal to end IP in range.")
 
             current_ip_int = int(start_ip)
             end_ip_int = int(end_ip)
@@ -59,95 +75,121 @@ def resolve_target(target_str):
                 ips.append(str(ipaddress.ip_address(current_ip_int)))
                 current_ip_int += 1
             return ips
-    except ValueError:
-        pass
-
+        except ValueError as e:
+            # Re-raise with context for clarity if range parsing fails
+            raise ValueError(f"Invalid IP range format '{target_str}': {e}") from e
+    
+    # Try single IP
     try:
-        # Single IP?
         ip_obj = ipaddress.ip_address(target_str)
         return [str(ip_obj)]
     except ValueError:
-        pass
+        pass # Not a single IP, continue
 
+    # Try Hostname
     try:
-        # Hostname
         addr_info = socket.getaddrinfo(target_str, None)
-        resolved_ips = list(set(info[4][0] for info in addr_info))
+        # Filter for unique IP addresses, preserving order as much as possible if important
+        # Using a set to ensure uniqueness then converting to list
+        resolved_ips = list(dict.fromkeys(info[4][0] for info in addr_info if validate_ip(info[4][0])))
         if not resolved_ips:
-            raise socket.gaierror(f"Hostname {target_str} could not be resolved.")
+            # Raise a specific socket error if hostname resolves but no valid IPs are found
+            raise socket.gaierror(f"Hostname '{target_str}' resolved but no valid IP addresses found.")
         return resolved_ips
     except socket.gaierror as e:
-        print(f"Error resolving hostname {target_str}: {e}")
-        return []
+        # Re-raise socket.gaierror for unresolvable hostnames
+        raise e
+    except Exception as e:
+        logger.error(f"An unexpected error occurred during resolution of '{target_str}': {e}")
+        return [] # Return empty list on unexpected errors
 
-def parse_targets(target_args, input_file):
-    """Parses all target specifications into a flat list of unique IP addresses."""
-    all_ips = set()
+def parse_targets(target_args: Iterable[str], input_file: Optional[str]) -> List[str]:
+    """
+    Parses all target specifications (CLI args and input file) into a flat list of unique IP addresses.
+    Logs errors for invalid targets but continues processing others.
+    """
+    all_ips: set[str] = set()
     raw_targets = list(target_args)
 
     if input_file:
         try:
-            with open(input_file, 'r') as f:
+            with open(input_file, 'r', encoding='utf-8') as f:
                 for line in f:
                     line = line.strip()
                     if line and not line.startswith('#'):
                         raw_targets.append(line)
         except FileNotFoundError:
-            print(f"Error: Input file '{input_file}' not found.")
-            return []
+            logger.error(f"Error: Input file '{input_file}' not found.")
+            return [] # Critical error, cannot proceed without input file
         except Exception as e:
-            print(f"Error reading input file '{input_file}': {e}")
-            return []
+            logger.error(f"Error reading input file '{input_file}': {e}")
+            return [] # Critical error
+
+    if not raw_targets:
+        logger.warning("No targets specified for scanning.")
+        return []
 
     for target_str in raw_targets:
-        resolved = resolve_target(target_str)
-        for ip in resolved:
-            all_ips.add(ip)
+        try:
+            resolved = resolve_target(target_str)
+            for ip in resolved:
+                if validate_ip(ip):
+                    all_ips.add(ip)
+                else:
+                    logger.warning(f"Skipping invalid IP '{ip}' resolved from '{target_str}'.")
+        except (ValueError, socket.gaierror) as e:
+            logger.warning(f"Could not resolve target '{target_str}': {e}")
+        except Exception as e:
+            logger.warning(f"An unexpected error occurred while processing target '{target_str}': {e}")
 
-    return sorted(all_ips)
+    if not all_ips:
+        logger.error("No valid IP addresses could be parsed from the provided targets. Exiting.")
 
-def parse_ports(port_str=None, top_n_ports_count=None):
-    """Parses port string (e.g., '22,80-100,443') or top N into a list of unique integers."""
-    ports = set()
+    return sorted(list(all_ips))
+
+def parse_ports(port_str: Optional[str] = None, top_n_ports_count: Optional[int] = None) -> List[int]:
+    """
+    Parses port string (e.g., '22,80-100,443') or top N into a list of unique integers.
+    If neither is specified, defaults to TOP_PORTS[1000].
+    Raises ValueError for invalid port specifications.
+    """
+    ports: set[int] = set()
 
     if top_n_ports_count:
-        ports = set(TOP_PORTS.get(top_n_ports_count, []))
-        if not ports:
-            print(f"Warning: No predefined list for top {top_n_ports_count} ports. Using top 1000.")
-            ports = set(TOP_PORTS.get(1000, []))
-        return sorted(ports)
+        if top_n_ports_count in TOP_PORTS:
+            ports.update(TOP_PORTS[top_n_ports_count])
+        else:
+            logger.warning(f"No predefined list for top {top_n_ports_count} ports. Falling back to top 1000.")
+            ports.update(TOP_PORTS.get(1000, []))
+        return sorted(list(ports))
 
     if not port_str:
+        # Default behavior: if no ports or top-ports specified, use top 1000
+        logger.info("No ports specified. Defaulting to top 1000 common ports.")
         return sorted(TOP_PORTS.get(1000, []))
 
-    try:
-        components = port_str.split(',')
-        for comp in components:
-            comp = comp.strip()
-            if not comp:
-                continue
+    components = port_str.split(',')
+    for comp in components:
+        comp = comp.strip()
+        if not comp:
+            continue
+        try:
             if '-' in comp:
-                start, end = map(int, comp.split('-'))
-                if not (1 <= start <= 65535 and 1 <= end <= 65535 and start <= end):
-                    raise ValueError(f"Invalid port range: {comp}.")
+                start_str, end_str = comp.split('-')
+                start = int(start_str)
+                end = int(end_str)
+                if not (validate_port(start) and validate_port(end) and start <= end):
+                    raise ValueError(f"Invalid port range: {comp}. Ports must be between 1 and 65535, and start <= end.")
                 ports.update(range(start, end + 1))
             else:
                 port = int(comp)
-                if not (1 <= port <= 65535):
-                    raise ValueError(f"Invalid port: {port}.")
+                if not validate_port(port):
+                    raise ValueError(f"Invalid port: {port}. Port must be between 1 and 65535.")
                 ports.add(port)
-    except ValueError as e:
-        print(f"Error parsing ports: {e}")
-        return []
+        except ValueError as e:
+            raise ValueError(f"Error parsing port component '{comp}': {e}") from e
 
     if not ports:
-        raise ValueError("No valid ports specified.")
+        raise ValueError("No valid ports could be parsed from the input.")
 
-    return sorted(ports)
-
-# Uncomment for CLI testing:
-# if __name__ == "__main__":
-#     targets = parse_targets(['127.0.0.1', 'scanme.nmap.org', '192.168.1.1-3'], None)
-#     ports = parse_ports('22,80-100,443')
-#     print(f"Resolved Targets: {targets}")
-#     print(f"Parsed Ports: {ports}")
+    return sorted(list(ports))

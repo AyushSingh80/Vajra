@@ -1,181 +1,213 @@
 # scanner/cli.py
-
 import argparse
 import asyncio
-from scanner import scan_ports
-from service_detector import detect_service
-from output_formatter import save_json, save_csv
-from utils import parse_ports, parse_targets
-from scanner.rate_limiter import RateLimiter
+import logging
 
+# Corrected imports for internal modules
+from .scanner import Scanner # Import the main Scanner class
+from .output_formatter import save_json, save_csv
+from .utils import parse_ports, parse_targets, validate_ip, validate_port # Added validate_ip, validate_port for CLI validation
 
-def main():
-    parser = argparse.ArgumentParser(
-        description='⚡ Advanced Network Port Scanner - Modular, Efficient, Ethical'
-    )
+# Configure logging for CLI feedback
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+logger = logging.getLogger(__name__)
 
-    # --- Target Specification ---
-    parser.add_argument(
-        "targets", nargs="*", help="Target IPs, hostnames, ranges (e.g., 192.168.1.1-100), or CIDR (e.g., 192.168.1.0/24)."
-    )
-    parser.add_argument(
-        "-iL", "--input-file", help="Scan targets from file (one target per line)."
-    )
-
-    # --- Port Specification ---
-    port_group = parser.add_mutually_exclusive_group()
-    port_group.add_argument(
-        "-p", "--ports", help="Ports to scan, e.g., '22', '80,443', '1-1024'."
-    )
-    port_group.add_argument(
-        "--top-ports", type=int, metavar="N",
-        help="Scan top N most common ports."
-    )
-
-    # --- Scan Techniques ---
-    scan_type_group = parser.add_mutually_exclusive_group()
-    scan_type_group.add_argument("-sT", "--tcp-connect", action="store_true",
-                                 help="TCP Connect scan (default).")
-    scan_type_group.add_argument("-sS", "--tcp-syn", action="store_true",
-                                 help="TCP SYN (Stealth) scan (root required).")
-    scan_type_group.add_argument("-sU", "--udp-scan", action="store_true",
-                                 help="UDP scan (root required for ICMP).")
-    scan_type_group.add_argument("-sA", "--ack-scan", action="store_true",
-                                 help="TCP ACK scan (NYI - Future).")
-    scan_type_group.add_argument("-sF", "--fin-scan", action="store_true",
-                                 help="TCP FIN scan (NYI - Future).")
-    scan_type_group.add_argument("-sX", "--xmas-scan", action="store_true",
-                                 help="TCP Xmas scan (NYI - Future).")
-    scan_type_group.add_argument("-sN", "--null-scan", action="store_true",
-                                 help="TCP Null scan (NYI - Future).")
-
-    # --- Service & OS Detection ---
-    parser.add_argument("-sV", "--service-version", action="store_true",
-                        help="Service/version detection.")
-    parser.add_argument("-O", "--os-detection", action="store_true",
-                        help="OS detection (NYI - Future).")
-
-    # --- Performance & Timing ---
-    parser.add_argument("--timeout", type=float, default=1.0,
-                        help="Timeout in seconds per probe (default: 1.0).")
-    parser.add_argument("--retries", type=int, default=1,
-                        help="Retries for failed probes (default: 1).")
-    parser.add_argument("--max-concurrency", type=int, default=100,
-                        help="Max concurrent scan tasks (default: 100).")
-    parser.add_argument("--rate", type=float, default=0,
-                        help="Max packets per second (0 = unlimited) [Future Feature].")
-
-    # --- Output Options ---
-    output_group = parser.add_argument_group("Output Options")
-    output_group.add_argument("-oJ", "--output-json", metavar="FILE",
-                              help="Save results to JSON file.")
-    output_group.add_argument("-oC", "--output-csv", metavar="FILE",
-                              help="Save results to CSV file.")
-    output_group.add_argument("-oX", "--output-xml", metavar="FILE",
-                              help="Output XML (Nmap-like) [NYI - Future].")
-    output_group.add_argument("-oG", "--output-grepable", metavar="FILE",
-                              help="Output Grepable format [NYI - Future].")
-
-    # --- Logging and Debugging ---
-    parser.add_argument("-v", "--verbose", action="store_true",
-                        help="Verbose output during scanning.")
-    parser.add_argument("--debug", action="store_true",
-                        help="Enable debug logging.")
-
-    # Parse CLI Arguments
-    args = parser.parse_args()
-
-    # Process Targets from CLI or Input File
-    targets = parse_targets(args.targets, args.input_file)
-    if not targets:
-        print("[!] No valid targets specified. Exiting.")
-        return
-
-    # Process Ports from CLI or Top N
-    ports = parse_ports(args.ports, args.top_ports)
-    if not ports:
-        print("[!] No valid ports specified. Exiting.")
-        return
-
-    # Determine Scan Type
-    if args.tcp_syn:
-        scan_type = 'SYN'
-    elif args.udp_scan:
-        scan_type = 'UDP'
-    elif args.ack_scan:
-        scan_type = 'ACK'   # NYI
-    elif args.fin_scan:
-        scan_type = 'FIN'   # NYI
-    elif args.xmas_scan:
-        scan_type = 'XMAS'  # NYI
-    elif args.null_scan:
-        scan_type = 'NULL'  # NYI
-    else:
-        scan_type = 'TCP'  # Default TCP Connect scan
-
-    # Run the async scanning routine
-    asyncio.run(run_scan(targets, ports, scan_type, args))
-
-
-async def run_scan(targets, ports, scan_type, args):
+async def run_scan(args):
     """
     Main async scanning workflow.
     """
+    targets = parse_targets(args.targets, args.input_file)
+    if not targets:
+        logger.error("No valid targets specified. Exiting.")
+        return
 
-    # Initialize rate limiter if user specified rate limit > 0, else None (unlimited)
-    rate_limiter = RateLimiter(args.rate) if args.rate > 0 else None
+    ports = parse_ports(args.ports, args.top_ports)
+    if not ports:
+        logger.error("No valid ports specified for scanning. Exiting.")
+        return
 
-    if rate_limiter:
-        await rate_limiter.start()
+    # Initialize the Scanner class with all relevant arguments
+    # Note: Service detection and OS detection are now handled by the Scanner class itself
+    # and passed via its constructor.
+    scanner = Scanner(
+        target="dummy", # This will be set per target in the loop below
+        ports=ports,
+        scan_type=args.scan_type,
+        timeout=args.timeout,
+        retries=args.retries,
+        rate_limit=args.rate,
+        concurrency=args.max_concurrency,
+        service_detection=args.service_version,
+        os_detection=args.os_detection, # Pass this even if not fully implemented yet
+        verbose=args.verbose
+    )
 
     all_results = []
+    
+    # Start rate limiter if enabled (it's managed internally by Scanner, but starting it explicitly here if not part of Scanner)
+    # The Scanner class's run() method now handles rate_limiter start/stop.
 
-    # Scan each target sequentially (could be parallelized if desired)
-    for target in targets:
-        results = await scan_ports(
-            target=target,
-            ports=ports,
-            rate_limiter=rate_limiter,
-            scan_type=scan_type,
-            timeout=args.timeout,
-            retries=args.retries,
-            concurrency=args.max_concurrency,
-            verbose=args.verbose,
-            debug=args.debug
-        )
+    print(f"\n[*] Starting scan on {len(targets)} target(s) for {len(ports)} port(s) with {args.scan_type.upper()} scan...\n")
 
-        final_results = []
-        for port, status in results:
-            service = None
-            if args.service_version and status is True:
-                service = detect_service(target, port)
-            final_results.append({
-                'host': target,
-                'port': port,
-                'status': 'open' if status is True else status,
-                'service': service or ''
-            })
+    for target_ip in targets:
+        # Update the scanner's target for the current IP
+        scanner.target = target_ip
+        
+        # Run the scan for the current target
+        # The scanner.run() method returns a list of ScanResult objects
+        try:
+            results_for_target = await scanner.run()
+            all_results.extend(results_for_target)
 
-        all_results.extend(final_results)
-
-        # Console Output: Print each scanned port result
-        for entry in final_results:
-            line = f"[+] {entry['host']}:{entry['port']} -> {entry['status']}"
-            if entry['service']:
-                line += f" | {entry['service']}"
-            print(line)
-
-    if rate_limiter:
-        await rate_limiter.stop()
+            # Console Output: Print each scanned port result
+            for entry in results_for_target:
+                line = f"[+] {entry.host}:{entry.port} -> {entry.status}"
+                if entry.service:
+                    line += f" | Service: {entry.service}"
+                if entry.banner: # If banner is collected, print it
+                    line += f" | Banner: {entry.banner[:50]}..." if len(entry.banner) > 50 else f" | Banner: {entry.banner}"
+                if entry.os_info: # If OS info is collected, print it
+                    line += f" | OS: {entry.os_info.get('name', 'Unknown')}"
+                print(line)
+        except Exception as e:
+            logger.error(f"Failed to scan target {target_ip}: {e}")
 
     # Save results to files if specified
     if args.output_json:
-        save_json(all_results, args.output_json)
+        # Convert ScanResult objects to dictionaries for JSON serialization
+        json_output = [res.__dict__ for res in all_results]
+        save_json(json_output, args.output_json)
+        logger.info(f"Results saved to {args.output_json}")
     if args.output_csv:
-        save_csv(all_results, args.output_csv)
+        # CSV formatter expects a list of dictionaries as before
+        csv_output = [res.__dict__ for res in all_results]
+        save_csv(csv_output, args.output_csv)
+        logger.info(f"Results saved to {args.output_csv}")
 
-    # NYI: XML and Grepable output - To be implemented in future releases
+    print("\n[*] Scan completed.")
 
+def main():
+    parser = argparse.ArgumentParser(
+        description="A fast and flexible asynchronous port scanner.",
+        formatter_class=argparse.RawTextHelpFormatter
+    )
+
+    # Target Specification
+    target_group = parser.add_mutually_exclusive_group(required=True)
+    target_group.add_argument(
+        'targets', nargs='*', help='Target IP(s), hostname(s), CIDR (e.g., 192.168.1.0/24), or IP range (e.g., 192.168.1.1-10).'
+    )
+    target_group.add_argument(
+        '-iL', '--input-file', metavar='FILE', help='Input file with targets, one per line.'
+    )
+
+    # Port Specification
+    port_group = parser.add_mutually_exclusive_group()
+    port_group.add_argument(
+        '-p', '--ports', metavar='PORTS',
+        help='Ports to scan (e.g., "22,80,443" or "1-1024").\nDefaults to top 1000 ports if not specified.'
+    )
+    port_group.add_argument(
+        '--top-ports', type=int, choices=[10, 100, 1000],
+        help='Scan top N common ports (10, 100, or 1000).\nOverrides -p if specified.'
+    )
+
+    # Scan Type
+    parser.add_argument(
+        '-sT', dest='scan_type', action='store_const', const='tcp', default='syn',
+        help='TCP Connect scan (default if no other scan type specified is SYN).'
+    )
+    parser.add_argument(
+        '-sS', dest='scan_type', action='store_const', const='syn',
+        help='TCP SYN scan (default).'
+    )
+    parser.add_argument(
+        '-sU', dest='scan_type', action='store_const', const='udp',
+        help='UDP scan.'
+    )
+    parser.add_argument(
+        '-sF', dest='scan_type', action='store_const', const='fin',
+        help='FIN scan.'
+    )
+    parser.add_argument(
+        '-sN', dest='scan_type', action='store_const', const='null',
+        help='NULL scan.'
+    )
+    parser.add_argument(
+        '-sX', dest='scan_type', action='store_const', const='xmas',
+        help='XMAS scan.'
+    )
+    parser.add_argument(
+        '-sA', dest='scan_type', action='store_const', const='ack',
+        help='ACK scan.'
+    )
+
+    # Performance and Reliability
+    parser.add_argument(
+        '-t', '--timeout', type=float, default=2.0,
+        help='Timeout for each port scan in seconds (default: 2.0).'
+    )
+    parser.add_argument(
+        '-r', '--retries', type=int, default=1,
+        help='Number of retries for each port scan (default: 1).'
+    )
+    parser.add_argument(
+        '--rate', type=float, default=0,
+        help='Maximum packets per second (0 for unlimited, default: 0).'
+    )
+    parser.add_argument(
+        '-c', '--max-concurrency', type=int, default=100,
+        help='Maximum concurrent connections/tasks (default: 100).'
+    )
+
+    # Service Detection
+    parser.add_argument(
+        '-sV', '--service-version', action='store_true',
+        help='Attempt to detect service and version on open ports.'
+    )
+    
+    # OS Detection (Placeholder for future functionality)
+    parser.add_argument(
+        '-O', '--os-detection', action='store_true',
+        help='Attempt to detect OS (Not yet implemented).'
+    )
+
+    # Output Options
+    parser.add_argument(
+        '-oJ', '--output-json', metavar='FILE',
+        help='Output scan results to a JSON file.'
+    )
+    parser.add_argument(
+        '-oC', '--output-csv', metavar='FILE',
+        help='Output scan results to a CSV file.'
+    )
+    parser.add_argument(
+        '-v', '--verbose', action='store_true',
+        help='Enable verbose output for more details during scanning.'
+    )
+    parser.add_argument(
+        '--debug', action='store_true',
+        help='Enable debug logging (much more verbose).'
+    )
+
+
+    args = parser.parse_args()
+
+    # Set logging level based on arguments
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+    elif args.verbose:
+        logging.getLogger().setLevel(logging.INFO)
+    else:
+        logging.getLogger().setLevel(logging.WARNING) # Default to WARNING for less output
+
+    # Run the async scanning routine
+    try:
+        asyncio.run(run_scan(args))
+    except KeyboardInterrupt:
+        logger.warning("\nScan interrupted by user.")
+    except Exception as e:
+        logger.critical(f"An unhandled error occurred: {e}")
 
 if __name__ == "__main__":
     main()

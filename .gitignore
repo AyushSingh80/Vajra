@@ -1,0 +1,35 @@
+# Virtual environment
+venv/
+.venv/
+
+# Byte-code files
+__pycache__/
+*.pyc
+*.pyd
+*.pyo
+
+# IDE-specific files (optional, but good practice)
+.vscode/   # If you use VS Code and don't want to commit workspace settings
+.idea/     # If you use PyCharm
+*.sublime-project
+*.sublime-workspace
+
+# Logs and other temporary files
+*.log
+*.sqlite3  # For Django/Flask default databases
+db.sqlite3 # Specific for Django
+
+# Environment variables
+.env
+env.local
+
+# Testing and coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+.eggs/
